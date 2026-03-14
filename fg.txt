@@ -1,0 +1,486 @@
+(function () {
+  if (window.__fogoBotTimer) clearInterval(window.__fogoBotTimer);
+  if (window.__fogoUpgradeTimer) clearInterval(window.__fogoUpgradeTimer);
+
+  document.querySelectorAll('canvas').forEach(c => c.style.display = 'none');
+
+  const botToken = "";
+  const chatId   = "";
+
+  if (!window._origFetch) window._origFetch = window.fetch;
+
+  async function sendTG(msg){
+    try{
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 8000);
+      await window._origFetch("https://api.telegram.org/bot" + botToken + "/sendMessage", {
+        method:"POST", headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({chat_id:chatId, text:msg, parse_mode:"Markdown"}),
+        signal:controller.signal
+      });
+      clearTimeout(t);
+    }catch(e){}
+  }
+
+  // TX STATE
+  let txOnChain=0, txBuffer=[], txFailed=0, tx6036=0;
+  let txLastSig="-";
+  const txHistory=[];
+  const startTime=Date.now();
+
+  // =========================
+  // UPGRADE STATE MACHINE
+  // Logic baru:
+  // - Cek "X casts to complete" di DOM (selalu visible tanpa buka modal)
+  // - Jika 0 atau tidak ada = upgrade tersedia
+  // - Klik rod icon untuk buka modal
+  // - Klik COMPLETE UPGRADE jika ada
+  // - Klik START UPGRADE jika ada
+  // - Tutup modal
+  // =========================
+  let upgradeCount    = 0;
+  let upgradeStep     = "OPEN_ROD";
+  let upgradeStepTime = Date.now();
+  let lastUpgradeOpen = 0;
+  let CHECK_INTERVAL  = 30000;
+
+  const STEP_TIMEOUTS = {
+    "OPEN_ROD"        : 3000,
+    "WAIT_MENU"       : 6000,
+    "CLICK_COMPLETE"  : 4000,
+    "WAIT_START"      : 6000,
+    "CLICK_START"     : 4000,
+    "CLOSE_MODAL"     : 3000
+  };
+
+  function setUpgradeStep(step){
+    upgradeStep     = step;
+    upgradeStepTime = Date.now();
+    console.log("%c🎣 UPGRADE → " + step, "color:#ffcc00;font-weight:bold");
+  }
+
+  function forceClick(el){
+    if(!el) return false;
+    try{
+      el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));
+      el.dispatchEvent(new MouseEvent('mouseup',  {bubbles:true,cancelable:true}));
+      el.dispatchEvent(new MouseEvent('click',    {bubbles:true,cancelable:true}));
+      el.click();
+      return true;
+    }catch(e){ return false; }
+  }
+
+  // Klik Parent 1 dari rod img (pointer-events:auto, cursor:pointer)
+  function findRodIcon(){
+    const rodImg = document.querySelector('img[alt="Rod"]');
+    if(!rodImg) return null;
+    let el = rodImg.parentElement;
+    for(let i=0; i<5; i++){
+      if(!el || el.tagName==="BODY") break;
+      const style = el.getAttribute("style") || "";
+      if(style.includes("pointer-events: auto") && style.includes("cursor: poi")) return el;
+      el = el.parentElement;
+    }
+    // fallback: parent ke-2 dari img
+    return rodImg.parentElement?.parentElement || rodImg;
+  }
+
+  function findBtnByText(text){
+    const buttons = document.querySelectorAll("button");
+    for(let b of buttons){
+      const t=(b.innerText||b.textContent||"").trim().toUpperCase();
+      if(t.includes(text.toUpperCase()) && b.offsetParent!==null) return b;
+    }
+    return null;
+  }
+
+  function findCloseBtn(){
+    const a=document.querySelector('button[aria-label="Close"]');
+    if(a && a.offsetParent!==null) return a;
+    const buttons=document.querySelectorAll("button");
+    for(let b of buttons){
+      if((b.innerText||b.textContent||"").trim()==="×" && b.offsetParent!==null) return b;
+    }
+    return null;
+  }
+
+  // Deteksi "X casts to complete" — jika 0 atau tidak ada = upgrade ready
+  function getCastsToComplete(){
+    const spans=document.querySelectorAll("span");
+    for(let sp of spans){
+      const txt=(sp.innerText||sp.textContent||"").trim();
+      // Format: "6,746 casts to complete" atau "0 casts to complete"
+      const m=txt.match(/([\d,]+)\s+casts?\s+to\s+complete/i);
+      if(m){
+        const remaining=parseInt(m[1].replace(/,/g,""));
+        return { remaining, ready: remaining===0, raw: txt };
+      }
+    }
+    // Tidak ada span "casts to complete" = mungkin upgrade sudah ready
+    return null;
+  }
+
+  // Cek apakah modal upgrade sedang terbuka
+  function isUpgradeModalOpen(){
+    if(findBtnByText("COMPLETE UPGRADE")) return true;
+    if(findBtnByText("START UPGRADE"))    return true;
+    // Cek ada span "casts to complete" yang visible
+    const spans=document.querySelectorAll("span");
+    for(let sp of spans){
+      const txt=(sp.innerText||sp.textContent||"").trim();
+      if(txt.match(/casts?\s+to\s+complete/i) && sp.offsetParent!==null) return true;
+    }
+    return false;
+  }
+
+  function upgradeLoop(){
+    try{
+      const now     = Date.now();
+      const elapsed = now - upgradeStepTime;
+      const timeout = STEP_TIMEOUTS[upgradeStep] || 5000;
+
+      // Timeout guard
+      if(upgradeStep!=="OPEN_ROD" && elapsed>timeout){
+        console.log("%c⚠️ TIMEOUT: "+upgradeStep+" → reset","color:#ff4444");
+        const cb=findCloseBtn();
+        if(cb) forceClick(cb);
+        lastUpgradeOpen=now;
+        setUpgradeStep("OPEN_ROD");
+        return;
+      }
+
+      // --- OPEN_ROD ---
+      // Throttle tiap CHECK_INTERVAL, lalu buka modal untuk cek
+      if(upgradeStep==="OPEN_ROD"){
+        if(now-lastUpgradeOpen < CHECK_INTERVAL) return;
+
+        const rod=findRodIcon();
+        if(rod){
+          forceClick(rod);
+          lastUpgradeOpen=now;
+          console.log("%c🎣 Rod clicked — buka modal...","color:#aaffaa");
+          setUpgradeStep("WAIT_MENU");
+        } else {
+          console.log("%c⚠️ Rod icon tidak ditemukan","color:#ff8800");
+          lastUpgradeOpen=now;
+        }
+        return;
+      }
+
+      // --- WAIT_MENU ---
+      if(upgradeStep==="WAIT_MENU"){
+        if(!isUpgradeModalOpen()) return; // tunggu
+
+        // Modal terbuka — cek kondisi
+        const castsLeft = getCastsToComplete();
+        const completeBtn = findBtnByText("COMPLETE UPGRADE");
+        const startBtn    = findBtnByText("START UPGRADE");
+
+        console.log(
+          "%c📊 Modal terbuka | castsLeft: "+(castsLeft?castsLeft.raw:"N/A")+
+          " | COMPLETE: "+(completeBtn?"ADA":"tidak")+
+          " | START: "+(startBtn?"ADA":"tidak"),
+          "color:#00ccff;font-weight:bold"
+        );
+
+        if(completeBtn){
+          // Ada COMPLETE UPGRADE — klik dulu
+          setUpgradeStep("CLICK_COMPLETE");
+        } else if(startBtn){
+          // Langsung ada START UPGRADE — klik
+          setUpgradeStep("CLICK_START");
+        } else if(castsLeft && !castsLeft.ready){
+          // Belum waktunya upgrade
+          console.log("%c⏳ Belum ready: "+castsLeft.raw+" — tutup","color:#aaaaaa");
+          setUpgradeStep("CLOSE_MODAL");
+        } else {
+          // Tidak ada button apapun, tutup
+          setUpgradeStep("CLOSE_MODAL");
+        }
+        return;
+      }
+
+      // --- CLICK_COMPLETE ---
+      if(upgradeStep==="CLICK_COMPLETE"){
+        const btn=findBtnByText("COMPLETE UPGRADE");
+        if(btn){
+          forceClick(btn);
+          console.log("%c🔨 COMPLETE UPGRADE clicked!","color:#ff8800;font-weight:bold");
+          sendTG("🔨 *COMPLETE UPGRADE* clicked!\n⏱ `"+new Date().toLocaleTimeString()+"`");
+          setUpgradeStep("WAIT_START");
+        } else {
+          // Tidak ada, coba langsung START
+          setUpgradeStep("CLICK_START");
+        }
+        return;
+      }
+
+      // --- WAIT_START ---
+      if(upgradeStep==="WAIT_START"){
+        if(findBtnByText("START UPGRADE")) setUpgradeStep("CLICK_START");
+        return;
+      }
+
+      // --- CLICK_START ---
+      if(upgradeStep==="CLICK_START"){
+        const btn=findBtnByText("START UPGRADE");
+        if(btn){
+          forceClick(btn);
+          upgradeCount++;
+          console.log("%c🚀 START UPGRADE #"+upgradeCount+"!","color:#00ff88;font-weight:bold;font-size:13px");
+          sendTG(
+            "🚀 *ROD UPGRADE STARTED*\n"+
+            "━━━━━━━━━━━━━━━━━\n"+
+            "🎣 Upgrade ke   : `#"+upgradeCount+"`\n"+
+            "💰 Cost         : lihat game\n"+
+            "⏱ Time         : `"+new Date().toLocaleTimeString()+"`"
+          );
+          setUpgradeStep("CLOSE_MODAL");
+        }
+        return;
+      }
+
+      // --- CLOSE_MODAL ---
+      if(upgradeStep==="CLOSE_MODAL"){
+        const cb=findCloseBtn();
+        if(cb){
+          forceClick(cb);
+          console.log("%c✅ Modal ditutup — lanjut farming","color:#00ccff");
+        }
+        lastUpgradeOpen=now;
+        setUpgradeStep("OPEN_ROD");
+        return;
+      }
+
+    }catch(err){
+      console.log("Upgrade error:",err.message);
+      lastUpgradeOpen=Date.now();
+      setUpgradeStep("OPEN_ROD");
+    }
+  }
+
+  // REPORT TIAP 15 DETIK
+  setInterval(async function(){
+    const elapsed=((Date.now()-startTime)/1000/60).toFixed(1);
+    const tpm=elapsed>0?(txOnChain/parseFloat(elapsed)).toFixed(2):"0";
+    const total=txOnChain+txFailed+tx6036;
+    const winRate=total>0?((txOnChain/total)*100).toFixed(1):"0";
+    const lastSigShort=txLastSig!=="-"
+      ?txLastSig.substring(0,16)+"..."+txLastSig.substring(txLastSig.length-8):"-";
+    const recentList=txBuffer.length>0
+      ?txBuffer.slice(-5).map(function(t,i){
+        return (i+1)+". `"+t.substring(0,14)+"..."+t.substring(t.length-6)+"`";
+      }).join("\n"):"_belum ada TX baru_";
+    const castsLeft=getCastsToComplete();
+    const progStr=castsLeft?"`"+castsLeft.raw+"`":"`N/A`";
+    const msg=
+      "⚡️ *FOGO BOT LIVE*\n"+
+      "━━━━━━━━━━━━━━━━━\n"+
+      "✅ *TX On-Chain*  : `"+txOnChain+"`\n"+
+      "❌ *TX Failed*    : `"+txFailed+"`\n"+
+      "⚠️ *Error 6036*   : `"+tx6036+"`\n"+
+      "🎯 *Win Rate*     : `"+winRate+"%`\n"+
+      "📦 *TX/menit*     : `"+tpm+"`\n"+
+      "⏱ *Uptime*       : `"+elapsed+" menit`\n"+
+      "🎣 *Casts Left*   : "+progStr+"\n"+
+      "🔧 *Rod Upgrades* : `"+upgradeCount+"x`\n"+
+      "🔄 *Upgrade Step* : `"+upgradeStep+"`\n"+
+      "━━━━━━━━━━━━━━━━━\n"+
+      "🔗 *Last Sig*\n`"+lastSigShort+"`\n"+
+      "━━━━━━━━━━━━━━━━━\n"+
+      "📋 *TX 15s Terakhir*\n"+recentList+"\n"+
+      "🕐 `"+new Date().toLocaleTimeString()+"`";
+    await sendTG(msg);
+    txBuffer=[];
+  },15000);
+
+  // RPC
+  const RPC_ENDPOINTS=["https://mainnet.fogo.io"];
+  const OLD_RPC="fluxrpc.com";
+  let rpcIndex=0,consecutiveFails=0,backoffMs=0;
+  const rpcStats={sent:0,ok:0,rate429:0,errors:0};
+  function getCurrentRpc(){ return RPC_ENDPOINTS[rpcIndex]; }
+  function onRpcSuccess(){ consecutiveFails=0; backoffMs=0; rpcStats.ok++; }
+  function onRpcFail(status){
+    consecutiveFails++;
+    if(status===429) rpcStats.rate429++; else rpcStats.errors++;
+    backoffMs=Math.min(500*Math.pow(2,consecutiveFails-1),8000);
+    if(consecutiveFails>=5){ rpcIndex=(rpcIndex+1)%RPC_ENDPOINTS.length; consecutiveFails=0; }
+  }
+  function replaceRpcUrl(url){
+    if(typeof url==="string"&&url.includes(OLD_RPC)){
+      const u=new URL(url),target=new URL(getCurrentRpc());
+      u.hostname=target.hostname; u.protocol=target.protocol; return u.toString();
+    }
+    return url;
+  }
+
+  // FETCH OVERRIDE
+  window.fetch=async function(input,init){
+    let url=typeof input==="string"?input:input.url;
+    const newUrl=replaceRpcUrl(url);
+    if(newUrl!==url){ input=typeof input==="string"?newUrl:new Request(newUrl,input); }
+    try{
+      rpcStats.sent++;
+      const res=await window._origFetch.call(window,input,init);
+      res.clone().json().then(function(d){
+        if(d&&d.type==="success"&&d.signature){
+          txOnChain++; txLastSig=d.signature; txBuffer.push(d.signature);
+          txHistory.push({sig:d.signature,time:new Date().toLocaleTimeString()});
+          s="IDLE";
+          console.log("%c✅ ON-CHAIN TX #"+txOnChain+"\n→ "+d.signature,"color:#00ff88;font-weight:bold");
+        }
+        if(d&&typeof d.result==="string"&&d.result.length>40){
+          txOnChain++; txLastSig=d.result; txBuffer.push(d.result);
+          txHistory.push({sig:d.result,time:new Date().toLocaleTimeString()});
+          s="IDLE";
+          console.log("%c✅ ON-CHAIN TX #"+txOnChain+"\n→ "+d.result,"color:#00ff88;font-weight:bold");
+        }
+        if(d&&d.error){
+          const errStr=JSON.stringify(d.error);
+          if(errStr.includes("6036")){ tx6036++; s="IDLE"; castBtn=null;
+            console.log("%c⚠️ 6036 #"+tx6036+" — retry","color:#ffaa00;font-weight:bold");
+          } else { txFailed++; s="IDLE";
+            console.log("%c❌ TX FAILED #"+txFailed+" → "+errStr,"color:#ff4444;font-weight:bold");
+          }
+        }
+        if(d&&d.type==="error"&&!d.error){ txFailed++; s="IDLE"; }
+      }).catch(function(){});
+      if(res.status===429) onRpcFail(429); else if(res.ok) onRpcSuccess();
+      return res;
+    }catch(err){ onRpcFail(0); throw err; }
+  };
+
+  // SPEED
+  const S=8;
+  const _st=window.setTimeout;
+  const _si=window.setInterval;
+  window.setTimeout=(f,d,...a)=>_st(f,(d||0)/S,...a);
+  window.setInterval=(f,d,...a)=>_si(f,(d||0)/S,...a);
+
+  // BOT STATE
+  let c=0,ok=0,fail=0,s="IDLE";
+  let castBtn=null,missCount=0;
+  let lastStateChange=Date.now();
+  const STUCK_MS=4000;
+
+  function findCastBtn(){
+    if(castBtn&&document.contains(castBtn)) return castBtn;
+    const buttons=document.getElementsByTagName("button");
+    for(let b of buttons){
+      const t=b.innerText.trim().toUpperCase();
+      if(t.includes("CAST")&&!t.includes("SUPER")){ castBtn=b; missCount=0; return castBtn; }
+    }
+    missCount++;
+    if(missCount>20){ castBtn=null; missCount=0; }
+    return null;
+  }
+
+  function setState(ns){
+    if(s!==ns){ s=ns; lastStateChange=Date.now(); }
+  }
+
+  function go(){
+    try{
+      if(Date.now()-lastStateChange>STUCK_MS&&s!=="IDLE"){
+        setState("IDLE"); castBtn=null;
+      }
+      const b=findCastBtn();
+      if(!b) return;
+      const t=b.innerText.trim().toUpperCase();
+      const casting=t.includes("CASTING");
+      const dis=b.disabled;
+      if(s==="IDLE"&&!casting&&!dis){
+        b.click(); c++; setState("CLICKED"); console.log("Cast #"+c);
+      } else if(s==="CLICKED"&&casting){
+        setState("CASTING");
+      } else if(s==="CASTING"&&!casting&&!dis){
+        ok++;
+        if(ok%10===0) stats();
+        b.click(); c++; setState("CLICKED");
+        console.log("Success TX #"+ok);
+      } else if(s==="CLICKED"&&!casting&&dis){
+        fail++; setState("IDLE");
+      }
+    }catch(err){
+      console.log("Bot error:",err.message); setState("IDLE"); castBtn=null;
+    }
+  }
+
+  // STATS
+  window.stats=function(){
+    const elapsed=((Date.now()-startTime)/1000/60).toFixed(1);
+    const rate=c>0?((ok/c)*100).toFixed(1):"0";
+    const tpm=elapsed>0?(txOnChain/parseFloat(elapsed)).toFixed(2):"0";
+    const total=txOnChain+txFailed+tx6036;
+    const sr=total>0?((txOnChain/total)*100).toFixed(1):"0";
+    const cl=getCastsToComplete();
+    console.log(
+      "%c=== FOGO BOT STATS ===\n"+
+      "Uptime        : "+elapsed+" min\n"+
+      "Cast State    : "+s+"\n"+
+      "Upgrade Step  : "+upgradeStep+"\n"+
+      "Casts (UI)    : "+c+"\n"+
+      "OK (UI)       : "+ok+"\n"+
+      "Fail (UI)     : "+fail+"\n"+
+      "──────────────────────\n"+
+      "TX On-Chain   : "+txOnChain+"\n"+
+      "TX Failed     : "+txFailed+"\n"+
+      "Error 6036    : "+tx6036+"\n"+
+      "TX Real Rate  : "+sr+"%\n"+
+      "TX/menit      : "+tpm+"\n"+
+      "Last Sig      : "+txLastSig+"\n"+
+      "──────────────────────\n"+
+      "Casts to go   : "+(cl?cl.raw:"N/A (modal tutup)")+"\n"+
+      "Rod Upgrades  : "+upgradeCount+"x\n"+
+      "──────────────────────\n"+
+      "RPC OK        : "+rpcStats.ok+"\n"+
+      "RPC 429       : "+rpcStats.rate429+"\n"+
+      "RPC Errors    : "+rpcStats.errors+"\n"+
+      "======================",
+      "color:#00ccff;font-family:monospace;font-size:12px"
+    );
+  };
+
+  window.txlog=function(){
+    const last=txHistory.slice(-10);
+    if(!last.length){ console.log("Belum ada TX."); return; }
+    console.log("%c=== 10 TX TERAKHIR ===","color:#ffcc00;font-weight:bold");
+    last.forEach(function(t,i){ console.log((i+1)+". ["+t.time+"] "+t.sig); });
+  };
+
+  window.testUpgrade=function(){
+    lastUpgradeOpen=0;
+    setUpgradeStep("OPEN_ROD");
+    console.log("%c🧪 Manual upgrade trigger!","color:#ffff00;font-weight:bold");
+  };
+
+  window.setCheckInterval=function(detik){
+    CHECK_INTERVAL=detik*1000;
+    console.log("Check interval → "+detik+" detik");
+  };
+
+  window.stop=function(){
+    clearInterval(window.__fogoBotTimer);
+    clearInterval(window.__fogoUpgradeTimer);
+    window.setTimeout=_st; window.setInterval=_si;
+    document.querySelectorAll('canvas').forEach(c=>c.style.display='');
+    stats(); console.log("Bot stopped");
+  };
+
+  window.__fogoBotTimer    =_si(go,         800);
+  window.__fogoUpgradeTimer=_si(upgradeLoop,1000);
+
+  sendTG(
+    "🚀 *FOGO BOT v10 STARTED*\n"+
+    "━━━━━━━━━━━━━━━━━\n"+
+    "⚡️ Casting     : *NON-STOP*\n"+
+    "🎣 Auto Upgrade: *AKTIF*\n"+
+    "📡 Report      : *setiap 15 detik*\n"+
+    "🕐 Start       : `"+new Date().toLocaleTimeString()+"`"
+  );
+
+  console.log("%c⚡️ FOGO BOT v10 RUNNING","color:#00ff88;font-weight:bold;font-size:14px");
+  console.log("Commands: stats() | txlog() | testUpgrade() | setCheckInterval(detik) | stop()");
+
+})();
